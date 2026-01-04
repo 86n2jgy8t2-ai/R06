@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Station: Nightfall — High Quality on Quest (Single HTML)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html,body { margin:0; height:100%; background:#000; color:#ddd; font-family:Arial, Helvetica, sans-serif; }
+    #hud { position:absolute; left:12px; top:12px; z-index:999; background:rgba(0,0,0,0.7); padding:12px; border-radius:6px; width:380px; font-size:13px; }
+    #hud h3 { margin:0 0 8px 0; font-size:16px; }
+    #hud .row { margin-top:8px; display:flex; gap:8px; align-items:center; }
+    #status { margin-top:10px; color:#9fd; font-size:13px; }
+    select, button { background:#151515; color:#fff; border:1px solid #333; padding:6px 8px; border-radius:4px; }
+    canvas { display:block; }
+  </style>
+</head>
+<body>
+  <div id="hud">
+    <h3>Station: Nightfall — High Quality on Quest</h3>
+    <div>Trigger = grab / fire / chainsaw. Pinch to grab with hands. Punch with fast swings. Default quality is HIGH on Quest and Desktop; change via dropdown if needed.</div>
+    <div class="row">
+      <label for="quality">Quality:</label>
+      <select id="quality"><option value="auto">Auto</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+      <button id="applyQuality">Apply</button>
+    </div>
+    <div id="status">Initializing...</div>
+    <div style="margin-top:8px;font-size:12px;color:#bbb">Note: visuals (bloom/film/rim/shaders) remain consistent across presets; presets tune performance (DPR, particles, shadow resolution).</div>
+  </div>
+
+  <script type="module">
+  import * as THREE from 'https://unpkg.com/three@0.152.0/build/three.module.js';
+  import { GLTFLoader } from 'https://unpkg.com/three@0.152.0/examples/jsm/loaders/GLTFLoader.js';
+  import { VRButton } from 'https://unpkg.com/three@0.152.0/examples/jsm/webxr/VRButton.js';
+  import { XRHandModelFactory } from 'https://unpkg.com/three@0.152.0/examples/jsm/webxr/XRHandModelFactory.js';
+  import { OrbitControls } from 'https://unpkg.com/three@0.152.0/examples/jsm/controls/OrbitControls.js';
+  import { EffectComposer } from 'https://unpkg.com/three@0.152.0/examples/jsm/postprocessing/EffectComposer.js';
+  import { RenderPass } from 'https://unpkg.com/three@0.152.0/examples/jsm/postprocessing/RenderPass.js';
+  import { UnrealBloomPass } from 'https://unpkg.com/three@0.152.0/examples/jsm/postprocessing/UnrealBloomPass.js';
+  import { FilmPass } from 'https://unpkg.com/three@0.152.0/examples/jsm/postprocessing/FilmPass.js';
+  import { SkeletonUtils } from 'https://unpkg.com/three@0.152.0/examples/jsm/utils/SkeletonUtils.js';
+
+  // UI elements
+  const qualitySelect = document.getElementById('quality');
+  const applyBtn = document.getElementById('applyQuality');
+  const statusEl = document.getElementById('status');
+  function setStatus(t){ statusEl.textContent = t; }
+
+  // detect Quest more aggressively
+  const ua = navigator.userAgent || '';
+  const isQuest = /OculusBrowser|Quest|Quest 2|Quest2|QuestPro|Oculus/i.test(ua);
+
+  // Core scene data
+  let renderer, scene, camera, clock;
+  let composer, bloomPass, filmPass;
+  let controllerLeft, controllerRight;
+  let handLeft, handRight, handModelFactory;
+  const loader = new GLTFLoader();
+  const zombiePrototypes = [];
+  const activeZombies = [];
+  const mixers = [];
+  const tweens = [];
+  let dustPoints = null;
+
+  // Model URLs (remote GLB). Replace if needed.
+  const MODELS = [
+    { name: 'RobotExpressive', url: 'https://threejs.org/examples/models/gltf/RobotExpressive/RobotExpressive.glb' },
+    { name: 'Monster', url: 'https://github.com/KhronosGroup/glTF-Sample-Models/raw/master/2.0/Monster/glTF-Binary/Monster.glb' },
+    { name: 'Soldier', url: 'https://github.com/KhronosGroup/glTF-Sample-Models/raw/master/2.0/Soldier/glTF-Binary/Soldier.glb' },
+    { name: 'FastZombie', url: 'https://www.filer.dev/en/3d-model/fast-moving-zombie.glb' }
+  ];
+
+  // quality presets (performance only) — visuals preserved
+  const qualityPresets = {
+    high: { dpr: Math.min(window.devicePixelRatio, 2), particleCount: 520, shadowMap: 2048 },
+    medium: { dpr: Math.min(window.devicePixelRatio, 1.25), particleCount: 260, shadowMap: 1024 },
+    low: { dpr: 1.0, particleCount: 80, shadowMap: 512 }
+  };
+  function defaultPreset(){ return 'high'; } // forced high on Quest
+
+  // init
+  init();
+  async function init(){
+    clock = new THREE.Clock();
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x030205);
+
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.05, 200);
+    camera.position.set(0,1.6,3);
+
+    renderer = new THREE.WebGLRenderer({ antialias:true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.shadowMap.enabled = true;
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(VRButton.createButton(renderer));
+
+    // Postprocessing (kept for identical look)
+    composer = new EffectComposer(renderer);
+    composer.addPass(new RenderPass(scene, camera));
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth,window.innerHeight), 0.6, 0.4, 0.85);
+    composer.addPass(bloomPass);
+    filmPass = new FilmPass(0.12, 0.25, 1024, false); filmPass.renderToScreen = true;
+    composer.addPass(filmPass);
+    renderer._composer = composer;
+
+    // Lights
+    scene.add(new THREE.AmbientLight(0x20202a,0.6));
+    const dl = new THREE.DirectionalLight(0xffe8c0,0.95);
+    dl.position.set(3,5,2); dl.castShadow = true;
+    dl.shadow.mapSize.set(2048,2048);
+    scene.add(dl);
+
+    // Floor & table
+    const floor = new THREE.Mesh(new THREE.PlaneGeometry(40,40), new THREE.MeshStandardMaterial({ color:0x101010, roughness:0.96 }));
+    floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+    const table = new THREE.Mesh(new THREE.BoxGeometry(1.85,0.08,1.05), new THREE.MeshStandardMaterial({ color:0x4a2f21 }));
+    table.position.set(0,0.78,-1); table.castShadow = true; scene.add(table);
+
+    // dust points
+    createDustParticles();
+
+    // create chainsaw object
+    createChainsawOnTable();
+
+    // load models
+    setStatus('Loading zombie models (remote GLBs)...');
+    await loadModels();
+
+    setStatus('Applying gritty visuals...');
+    for (let i=0;i<zombiePrototypes.length;i++) zombifyModelAppearance(zombiePrototypes[i].scene, i);
+
+    setStatus('Spawning zombies...');
+    spawnZombies();
+
+    // controllers & hands
+    controllerRight = renderer.xr.getController(0); controllerLeft = renderer.xr.getController(1);
+    controllerRight.addEventListener('selectstart', onSelectStart); controllerRight.addEventListener('selectend', onSelectEnd);
+    controllerLeft.addEventListener('selectstart', onSelectStart); controllerLeft.addEventListener('selectend', onSelectEnd);
+    scene.add(controllerRight, controllerLeft);
+
+    handModelFactory = new XRHandModelFactory();
+    handRight = renderer.xr.getHand(0); handRight.add(handModelFactory.createHandModel(handRight,'mesh')); scene.add(handRight);
+    handLeft = renderer.xr.getHand(1); handLeft.add(handModelFactory.createHandModel(handLeft,'mesh')); scene.add(handLeft);
+
+    // desktop orbit
+    const controls = new OrbitControls(camera, renderer.domElement); controls.target.set(0,1.2,0); controls.update();
+
+    // init lastPose placeholders for punch detection
+    ['controller_0','controller_1','hand_0','hand_1'].forEach(k => setLastPose(k, new THREE.Vector3(), performance.now()/1000));
+
+    // default to HIGH even on Quest (per your request)
+    qualitySelect.value = 'high';
+    applyQualityPreset('high');
+    applyBtn.onclick = () => { let p = qualitySelect.value; if (p === 'auto') p = defaultPreset(); applyQualityPreset(p); };
+
+    window.addEventListener('resize', onWindowResize);
+
+    setStatus('Ready — Enter VR. Quality forced to HIGH by default (change if performance issues).');
+    renderer.setAnimationLoop(render);
+  }
+
+  // load remote models
+  async function loadModels(){
+    for (const m of MODELS){
+      setStatus(`Loading ${m.name}...`);
+      try {
+        const gltf = await loader.loadAsync(m.url);
+        zombiePrototypes.push({ name: m.name, scene: gltf.scene, animations: gltf.animations });
+      } catch (err) {
+        console.warn('Load failed for', m.url, err);
+      }
+    }
+    if (zombiePrototypes.length === 0) setStatus('No models loaded — check URLs/CORS.');
+  }
+
+  // dust particles and config
+  function createDustParticles(){
+    const geo = new THREE.BufferGeometry();
+    const maxCount = 600;
+    const arr = new Float32Array(maxCount*3);
+    for (let i=0;i<maxCount;i++){ arr[i*3+0] = (Math.random()-0.5)*8; arr[i*3+1] = Math.random()*2.5; arr[i*3+2] = (Math.random()-0.5)*10 - 1; }
+    geo.setAttribute('position', new THREE.BufferAttribute(arr,3));
+    const mat = new THREE.PointsMaterial({ color:0xfff6d6, size:0.01, opacity:0.46, transparent:true });
+    dustPoints = new THREE.Points(geo, mat); scene.add(dustPoints);
+    configureDustForPreset('high'); // keep look consistent
+  }
+  function configureDustForPreset(p){
+    if (!dustPoints) return;
+    let count = 520; if (p === 'medium') count = 260; if (p === 'low') count = 80;
+    dustPoints.geometry.setDrawRange(0, count);
+    dustPoints.material.size = (p==='high')?0.012:(p==='medium'?0.009:0.007);
+    dustPoints.material.opacity = (p==='high')?0.55:(p==='medium'?0.45:0.35);
+  }
+
+  // apply quality (performance-only). Visuals (bloom/film/etc.) are unchanged.
+  function applyQualityPreset(preset){
+    if (!['high','medium','low'].includes(preset)) preset = 'high';
+    const cfg = qualityPresets[preset];
+    renderer.setPixelRatio(cfg.dpr);
+    // adjust shadows map sizes on lights if present
+    scene.traverse(o => { if (o.isDirectionalLight || o.isSpotLight) { if (o.shadow && o.shadow.mapSize) { o.shadow.mapSize.width = cfg.shadowMap; o.shadow.mapSize.height = cfg.shadowMap; } } });
+    configureDustForPreset(preset);
+    if (renderer._composer) renderer._composer.setSize(window.innerWidth, window.innerHeight);
+    setStatus(`Quality: ${preset.toUpperCase()} (DPR=${cfg.dpr}, shadows=${cfg.shadowMap}, particles=${cfg.particleCount}). Visuals preserved.`);
+  }
+
+  // zombify visuals (makes models gritty / RE2-like)
+  function zombifyModelAppearance(root, variantIndex=0){
+    function randSeed(seed){ let x = Math.sin(seed)*10000; return ()=>{ x = Math.sin(x)*10000; return x - Math.floor(x); }; }
+    const rnd = randSeed(4312 + variantIndex*53);
+    // create blood canvas
+    function makeBloodCanvas(){ const c=document.createElement('canvas'); c.width=256; c.height=256; const ctx=c.getContext('2d'); ctx.clearRect(0,0,c.width,c.height); const blobs=3+Math.floor(rnd()*4); for(let i=0;i<blobs;i++){ const x=20+Math.floor(rnd()*(c.width-40)), y=20+Math.floor(rnd()*(c.height-40)), r=20+Math.floor(rnd()*80); const g=ctx.createRadialGradient(x,y,0,x,y,r); const rc=Math.floor(90+rnd()*80); g.addColorStop(0,`rgba(${180+rc},18,18,0.95)`); g.addColorStop(0.6,`rgba(${130+rc},20,20,0.48)`); g.addColorStop(1,'rgba(0,0,0,0.0)'); ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill(); const sc=5+Math.floor(rnd()*8); for(let s=0;s<sc;s++){ const sx=x+(rnd()-0.5)*r*1.6, sy=y+(rnd()-0.5)*r*1.6, sr=1+Math.floor(rnd()*6); ctx.fillStyle=`rgba(${200+Math.floor(rnd()*55)},30,30,${0.3+rnd()*0.5})`; ctx.beginPath(); ctx.arc(sx,sy,sr,0,Math.PI*2); ctx.fill(); } } return c; }
+    const bloodCanvas = makeBloodCanvas(); const bloodTex = new THREE.CanvasTexture(bloodCanvas); bloodTex.wrapS=bloodTex.wrapT=THREE.RepeatWrapping; bloodTex.needsUpdate=true;
+    // overlay shader (world-space grime + blood) - kept short here (same technique as earlier)
+    const uniforms = { time:{value:0}, grimeColor:{value:new THREE.Color(0x0b0a08)}, bloodMap:{value:bloodTex}, scale:{value:1.0}, opacity:{value:0.9} };
+    const vs = `varying vec3 vWorldPos; varying vec3 vNormal; void main(){ vNormal = normalize(normalMatrix * normal); vWorldPos = (modelMatrix * vec4(position,1.0)).xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+    const fs = `varying vec3 vWorldPos; varying vec3 vNormal; uniform float time; uniform vec3 grimeColor; uniform sampler2D bloodMap; uniform float scale; uniform float opacity; float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);} float noise(vec2 p){ vec2 i=floor(p); vec2 f=fract(p); float a=hash(i); float b=hash(i+vec2(1.0,0.0)); float c=hash(i+vec2(0.0,1.0)); float d=hash(i+vec2(1.0,1.0)); vec2 u=f*f*(3.0-2.0*f); return mix(a,b,u.x)+(c-a)*u.y*(1.0-u.x)+(d-b)*u.x*u.y;} void main(){ vec2 p = vWorldPos.xz * 0.5 * scale; float n = noise(p*2.0 + time*0.02); float normalFactor = pow(1.0 - max(0.0, dot(normalize(vNormal), vec3(0.0,1.0,0.0))), 1.25); float grime = smoothstep(0.35,0.7,n) * normalFactor; vec2 bloodUV = fract(vec2(vWorldPos.x*0.5, vWorldPos.y*0.5)); vec4 bloodSample = texture2D(bloodMap, bloodUV); vec3 grimeCol = mix(vec3(0.0), grimeColor, grime * 0.9); vec3 color = mix(vec3(0.0), grimeCol, grime); float bloodAmount = bloodSample.r; color = mix(color, vec3(0.25, 0.03, 0.03), bloodAmount * 0.95); float a = clamp(grime * 0.85 + bloodAmount * 0.9, 0.0, 1.0) * opacity; gl_FragColor = vec4(color, a); }`;
+    root.traverse(node => {
+      if (!node.isMesh) return;
+      const orig = node.material && node.material.color ? node.material.color.clone() : new THREE.Color(0x666666);
+      const gray = (orig.r + orig.g + orig.b) / 3;
+      const skinTint = new THREE.Color().setHSL(0.12 + rnd()*0.05, 0.18, Math.max(0.15, gray*0.9));
+      const clothingTint = new THREE.Color().lerpColors(new THREE.Color(0x332a2a), new THREE.Color(0x4a4238), rnd());
+      const useSkin = rnd() > 0.45;
+      const baseColor = useSkin ? skinTint : clothingTint;
+      const baseMat = new THREE.MeshStandardMaterial({ color: baseColor, roughness: 0.6 + rnd()*0.35, metalness: 0.0 + rnd()*0.08, envMapIntensity: 0.14, skinning: !!node.skeleton, morphTargets: !!node.morphTargetInfluences });
+      node.material = baseMat;
+      node.castShadow = true; node.receiveShadow = true;
+      const overlayMat = new THREE.ShaderMaterial({ uniforms: THREE.UniformsUtils.clone(uniforms), vertexShader: vs, fragmentShader: fs, transparent:true, depthWrite:false, side:THREE.DoubleSide });
+      overlayMat.uniforms.bloodMap.value = bloodTex; overlayMat.uniforms.scale.value = 1.0 + rnd()*0.6; overlayMat.uniforms.opacity.value = 0.9;
+      const overlay = new THREE.Mesh(node.geometry, overlayMat); overlay.position.copy(node.position); overlay.quaternion.copy(node.quaternion); overlay.scale.copy(node.scale); overlay.renderOrder = 999; if (node.parent) node.parent.add(overlay);
+      const lname = (node.name||'').toLowerCase(); if (lname.includes('head')||lname.includes('face')||lname.includes('skull')){ baseMat.emissive = new THREE.Color(0x1a0b04); baseMat.emissiveIntensity = 0.12 + rnd()*0.18; if (rnd() > 0.55){ const decal = new THREE.Mesh(new THREE.PlaneGeometry(0.18,0.12), new THREE.MeshStandardMaterial({ map: bloodTex, transparent:true, depthWrite:false, side:THREE.DoubleSide })); decal.position.copy(node.getWorldPosition(new THREE.Vector3())); decal.position.add(new THREE.Vector3((rnd()-0.5)*0.06, 0.04 + rnd()*0.06, 0.02)); decal.rotation.set(-0.3 + rnd()*0.6, rnd()*Math.PI*2, 0); decal.scale.set(0.8 + rnd()*0.9, 0.8 + rnd()*0.9, 1); root.add(decal); tweens.push((dt)=>{ decal.material.opacity = 1.0; return true; }); } }
+    });
+    const s = 0.94 + rnd()*0.16; root.scale.multiplyScalar(s);
+  }
+
+  // spawn zombies
+  function spawnZombies(){
+    const positions = [[-1.0,0,-5],[0.8,0,-5.5],[-1.6,0,-7],[1.3,0,-7.5],[0,0,-9]];
+    let i=0;
+    for (const pos of positions){
+      const proto = zombiePrototypes[i % zombiePrototypes.length];
+      const clone = SkeletonUtils.clone(proto.scene);
+      clone.position.set(pos[0], pos[1], pos[2]);
+      scene.add(clone);
+      const mixer = new THREE.AnimationMixer(clone); mixers.push(mixer);
+      const actions = {};
+      (proto.animations || []).forEach(clip => { actions[clip.name] = mixer.clipAction(clip); });
+      clone.userData = { mixer, actions, hp: 220 + Math.floor(Math.random()*80), alive:true };
+      const idle = actions['Idle'] || actions['Standing'] || Object.values(actions)[0];
+      if (idle) { idle.play(); clone.userData.currentAction = idle; }
+      activeZombies.push(clone);
+      i++;
+    }
+  }
+
+  // simplified chainsaw: create, pick via pointer/controller near
+  let interactableSaw = null;
+  function createChainsawOnTable(){
+    const saw = new THREE.Group();
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.28,0.08,0.12), new THREE.MeshStandardMaterial({ color:0x222222 }));
+    const bar = new THREE.Mesh(new THREE.BoxGeometry(0.68,0.04,0.06), new THREE.MeshStandardMaterial({ color:0x4a4a4a })); bar.position.set(0.34,0,0);
+    const handle = new THREE.Mesh(new THREE.CylinderGeometry(0.02,0.02,0.2,8), new THREE.MeshStandardMaterial({ color:0x151515 })); handle.rotation.z = Math.PI/2; handle.position.set(-0.26,0.02,0);
+    saw.add(body, bar, handle); saw.position.set(0.4,0.86,-1.02); saw.userData = { interactable:'saw', isSaw:true, active:false }; scene.add(saw); interactableSaw = saw;
+  }
+
+  // simplified grab state
+  window.grabbed = new Map();
+
+  // VR select handlers (pick up saw)
+  function onSelectStart(evt){
+    const controller = evt.target;
+    if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    if (interactableSaw){
+      const origin = new THREE.Vector3(); controller.getWorldPosition(origin);
+      const pos = new THREE.Vector3(); interactableSaw.getWorldPosition(pos);
+      if (pos.distanceTo(origin) < 0.8){
+        const pivot = new THREE.Object3D(); scene.add(pivot); pivot.position.copy(pos); pivot.add(interactableSaw); interactableSaw.position.set(0,0,0);
+        window.grabbed.set(controller, { object: interactableSaw, pivot });
+        setStatus('Picked up chainsaw — hold trigger to spin, release to drop.');
+        return;
+      }
+    }
+    // else: basic fire/punch logic could go here
+  }
+  function onSelectEnd(evt){
+    const controller = evt.target;
+    if (activeChainsawAudio.has(controller)) stopChainsaw(controller);
+    if (window.grabbed && window.grabbed.get(controller)){
+      const info = window.grabbed.get(controller);
+      const obj = info.object, pivot = info.pivot;
+      pivot.updateMatrixWorld(true);
+      const worldMat = pivot.matrixWorld.clone();
+      const pos = new THREE.Vector3().setFromMatrixPosition(worldMat);
+      scene.add(obj); obj.position.copy(pos);
+      if (pivot.parent) pivot.parent.remove(pivot);
+      window.grabbed.delete(controller);
+      setStatus('Dropped chainsaw.');
+    }
+  }
+
+  // Audio + chainsaw
+  const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  function createChainsawSound(){ const ctx = audioCtx; const noise = ctx.createBufferSource(); const buf = ctx.createBuffer(1, ctx.sampleRate*2, ctx.sampleRate); const d = buf.getChannelData(0); for (let i=0;i<d.length;i++) d[i] = (Math.random()*2-1)*0.6; noise.buffer = buf; noise.loop = true; const osc = ctx.createOscillator(); osc.type='sawtooth'; osc.frequency.value = 90; const g = ctx.createGain(); g.gain.value = 0; const hp = ctx.createBiquadFilter(); hp.type='highpass'; hp.frequency.value = 700; osc.connect(g); noise.connect(hp); hp.connect(g); g.connect(ctx.destination); return { start(){ try{osc.start(); noise.start();}catch(e){} g.gain.setTargetAtTime(0.22,ctx.currentTime,0.02); }, stop(){ g.gain.setTargetAtTime(0.0001,ctx.currentTime,0.02); try{osc.stop(); noise.stop();}catch(e){} } }; }
+  function startChainsaw(controller){ if (activeChainsawAudio.has(controller)) return; const h = createChainsawSound(); h.start(); activeChainsawAudio.set(controller,h); activeChainsawTick.set(controller, performance.now()/1000); const info = window.grabbed && window.grabbed.get(controller); if (info && info.object) info.object.userData.active = true; setStatus('Chainsaw active'); }
+  function stopChainsaw(controller){ const h = activeChainsawAudio.get(controller); if (h){ h.stop(); activeChainsawAudio.delete(controller); activeChainsawTick.delete(controller); } const info = window.grabbed && window.grabbed.get(controller); if (info && info.object) info.object.userData.active = false; setStatus('Chainsaw stopped'); }
+  function applyChainsawDamage(controller){ if (!activeChainsawAudio.has(controller)) return; const info = window.grabbed && window.grabbed.get(controller); if (!info || !info.object || !info.object.userData || !info.object.userData.isSaw) return; const sawPos = new THREE.Vector3(); info.object.getWorldPosition(sawPos); const last = activeChainsawTick.get(controller) || performance.now()/1000; const now = performance.now()/1000; if (now - last < 0.12) return; activeChainsawTick.set(controller, now); for (const z of activeZombies){ if (!z.userData.alive) continue; if (z.position.distanceTo(sawPos) < 1.0){ damageEnemy(z, 100 * 0.12, sawPos); } } }
+
+  // punch detection
+  const lastPose = new Map();
+  function setLastPose(k,pos,t){ lastPose.set(k,{ pos: pos.clone(), time: t, cooldown: lastPose.get(k)?.cooldown || 0 }); }
+  function getLastPose(k){ return lastPose.get(k); }
+  function setCooldown(k,v){ const p = lastPose.get(k) || { pos:new THREE.Vector3(), time: performance.now()/1000, cooldown:0 }; p.cooldown = v; lastPose.set(k,p); }
+  function getCooldown(k){ return lastPose.get(k)?.cooldown || 0; }
+  function computeAndApplyPunchs(){
+    const now = performance.now()/1000;
+    const list = [ { key:'controller_0', ctrl: controllerRight }, { key:'controller_1', ctrl: controllerLeft }, { key:'hand_0', ctrl: handRight }, { key:'hand_1', ctrl: handLeft } ];
+    list.forEach(entry=>{
+      const ctrl = entry.ctrl; const key = entry.key; if (!ctrl) return;
+      const pos = new THREE.Vector3(); ctrl.getWorldPosition(pos);
+      const prev = getLastPose(key);
+      if (!prev){ setLastPose(key,pos,now); return; }
+      const dt = now - prev.time; if (dt <= 0){ setLastPose(key,pos,now); return; }
+      const vel = pos.clone().sub(prev.pos).length() / dt;
+      lastPose.set(key,{ pos: pos.clone(), time: now, cooldown: prev.cooldown || 0 });
+      if (getCooldown(key) > now) return;
+      const holding = window.grabbed && window.grabbed.get(ctrl);
+      const holdingWeapon = holding && holding.object && holding.object.userData && (holding.object.userData.type === 'pistol' || holding.object.userData.type === 'shotgun' || holding.object.userData.isSaw);
+      if (vel > 1.2 && !holdingWeapon){
+        applyPunch(pos, key, vel);
+        setCooldown(key, now + 0.45);
+      }
+    });
+  }
+  function applyPunch(worldPos, key, vel){
+    let hit = false;
+    for (const z of activeZombies){
+      if (!z.userData.alive) continue;
+      const d = z.position.distanceTo(worldPos);
+      if (d <= 1.1){
+        const dmg = Math.round(40 * Math.min(1.6, vel / 1.2));
+        damageEnemy(z, dmg, worldPos);
+        const knock = new THREE.Vector3().subVectors(z.position, worldPos).normalize().multiplyScalar(0.6);
+        z.position.add(knock);
+        hit = true;
+      }
+    }
+    if (hit){ playPunchSound(); setStatus('Punch hit'); tryHapticPulse(controllerLeft, 0.02, 0.4); tryHapticPulse(controllerRight, 0.02, 0.4); }
+  }
+
+  // damage and blood
+  function damageEnemy(enemyObj, amount, hitPos){
+    if (!enemyObj.userData.alive) return;
+    enemyObj.userData.hp -= amount;
+    spawnBlood(hitPos || enemyObj.position);
+    if (enemyObj.userData.hp <= 0){
+      enemyObj.userData.alive = false; setStatus('Enemy killed');
+      if (enemyObj.userData.actions && enemyObj.userData.actions['Death']) playAction(enemyObj, 'Death', 0.08);
+      else { tweens.push((dt)=>{ enemyObj.scale.multiplyScalar(1 - dt*0.6); if (enemyObj.scale.x < 0.01){ if (enemyObj.parent) enemyObj.parent.remove(enemyObj); return true; } return false; }); }
+    }
+  }
+  function spawnBlood(pos){ const s = new THREE.Mesh(new THREE.SphereGeometry(0.03,8,8), new THREE.MeshStandardMaterial({ color:0x8b0b0b })); s.position.copy(pos).add(new THREE.Vector3((Math.random()-0.5)*0.2, (Math.random()*0.2), (Math.random()-0.5)*0.2)); scene.add(s); let t=0, life=2.0; tweens.push((dt)=>{ t+=dt; if (t>life){ if (s.parent) s.parent.remove(s); return true; } s.scale.multiplyScalar(1 - dt*0.02); return false; }); }
+
+  // animation helpers
+  function playAction(model, name, fade=0.15){
+    const acts = model.userData.actions; if (!acts) return; const next = acts[name]; if (!next) return; const cur = model.userData.currentAction; if (cur === next) return; if (cur) cur.fadeOut(fade); next.reset().fadeIn(fade).play(); model.userData.currentAction = next;
+  }
+
+  // render loop
+  function stepTweens(dt){ for (let i=tweens.length-1;i>=0;i--) if (tweens[i](dt)) tweens.splice(i,1); }
+  function render(){
+    const dt = Math.min(0.05, clock.getDelta());
+    scene.traverse(o => { if (o.material && o.material.uniforms && o.material.uniforms.time) o.material.uniforms.time.value += dt; });
+    mixers.forEach(m => m.update(dt));
+    stepTweens(dt);
+    computeAndApplyPunchs();
+    activeChainsawAudio.forEach((v, controller) => { applyChainsawDamage(controller); });
+    // simple zombie updates
+    const camPos = new THREE.Vector3(); camera.getWorldPosition(camPos);
+    for (const z of activeZombies){
+      if (!z.userData.alive) continue;
+      const toCam = new THREE.Vector3().subVectors(camPos, z.position); const dist = toCam.length();
+      if (dist < 7 && dist > 1.2){ toCam.normalize(); z.position.addScaledVector(toCam, dt * 0.6); if (z.userData.actions){ const walk = z.userData.actions['Walking'] || z.userData.actions['Walk'] || z.userData.actions['Run']; if (walk && z.userData.currentAction !== walk) playAction(z, Object.keys(z.userData.actions).find(n=>n==='Walking' || n==='Walk' || n==='Run')); } } else { if (z.userData.actions && z.userData.actions['Idle'] && z.userData.currentAction !== z.userData.actions['Idle']) playAction(z,'Idle'); }
+    }
+    if (renderer._composer) renderer._composer.render(dt); else renderer.render(scene, camera);
+  }
+
+  // utils
+  function onWindowResize(){ camera.aspect = window.innerWidth/window.innerHeight; camera.updateProjectionMatrix(); renderer.setSize(window.innerWidth, window.innerHeight); if (renderer._composer) renderer._composer.setSize(window.innerWidth, window.innerHeight); }
+  function setLastPose(k,pos,t){ lastPose.set(k,{ pos: pos.clone(), time: t, cooldown: lastPose.get(k)?.cooldown || 0 }); }
+  function playPunchSound(){ const t = audioCtx.currentTime; const o = audioCtx.createOscillator(), g = audioCtx.createGain(); o.type='sine'; o.frequency.value=200; g.gain.value=0.0001; g.gain.exponentialRampToValueAtTime(0.18,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+0.16); o.connect(g); g.connect(audioCtx.destination); o.start(t); o.stop(t+0.16); }
+  function tryHapticPulse(controller, duration=0.02, intensity=0.5){ try{ if (!controller || !controller.gamepad) return; const gp = controller.gamepad; if (gp.hapticActuators && gp.hapticActuators.length) gp.hapticActuators[0].pulse(intensity, Math.round(duration*1000)); else if (gp.vibrationActuator && gp.vibrationActuator.type === 'dual-rumble') gp.vibrationActuator.playEffect('dual-rumble',{ startDelay:0, duration:Math.round(duration*1000), weakMagnitude:intensity, strongMagnitude:intensity }); }catch(e){} }
+
+  // init lastPose entries
+  setLastPose('controller_0', new THREE.Vector3(), performance.now()/1000);
+  setLastPose('controller_1', new THREE.Vector3(), performance.now()/1000);
+  setLastPose('hand_0', new THREE.Vector3(), performance.now()/1000);
+  setLastPose('hand_1', new THREE.Vector3(), performance.now()/1000);
+
+  // Start with HIGH on Quest & Desktop as requested
+  qualitySelect.value = 'high';
+  applyBtn.onclick = ()=>{ let p = qualitySelect.value; if (p==='auto') p = defaultPreset(); applyQualityPreset(p); };
+
+  </script>
+</body>
+</html>
